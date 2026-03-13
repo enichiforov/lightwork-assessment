@@ -17,6 +17,8 @@ from enum import StrEnum
 
 
 class Level(StrEnum):
+    """Known log severity levels. Unknown all-caps levels are also accepted."""
+
     DEBUG = "DEBUG"
     INFO = "INFO"
     WARNING = "WARNING"
@@ -30,6 +32,8 @@ _GroupKey = tuple[str, _Fields]
 
 @dataclasses.dataclass(slots=True)
 class _Group:
+    """Accumulated state for a deduplication group."""
+
     first_ts: datetime
     last_ts: datetime
     count: int
@@ -37,7 +41,15 @@ class _Group:
 
 
 class _LogCompactor:
-    def __init__(self, dedup_window_seconds: int, error_threshold: int) -> None:
+    """Streaming log compactor: deduplicates entries, escalates repeated errors,
+    and enriches level based on HTTP status codes."""
+
+    def __init__(
+        self,
+        dedup_window_seconds: int,
+        error_threshold: int,
+    ) -> None:
+        """Initialise with deduplication window and escalation threshold."""
         self._window = dedup_window_seconds
         self._threshold = error_threshold
         self._groups: dict[_GroupKey, _Group] = {}
@@ -45,8 +57,12 @@ class _LogCompactor:
 
     @classmethod
     def process_file(
-        cls, file_path: str, dedup_window_seconds: int, error_threshold: int
+        cls,
+        file_path: str,
+        dedup_window_seconds: int,
+        error_threshold: int,
     ) -> Generator[str, None, None]:
+        """Open *file_path* and yield compacted log strings in chronological order."""
         compactor = cls(dedup_window_seconds, error_threshold)
         with open(file_path, encoding="utf-8") as fh:
             for raw_index, raw_line in enumerate(fh):
@@ -59,49 +75,77 @@ class _LogCompactor:
     # ── Stateful instance methods ────────────────────────────────────────
 
     def _feed(
-        self, ts: datetime, level: str, fields: _Fields, *, raw_index: int
+        self,
+        ts: datetime,
+        level: str,
+        fields: _Fields,
+        *,
+        raw_index: int,
     ) -> Generator[str, None, None]:
+        """Absorb one parsed entry, flushing expired groups first."""
         yield from self._flush_expired(ts)
-        key: _GroupKey = (level, fields)
-        if key in self._groups:
-            g = self._groups[key]
-            g.last_ts = ts
-            g.count += 1
+        group_key: _GroupKey = (level, fields)
+        if group_key in self._groups:
+            group = self._groups[group_key]
+            group.last_ts = ts
+            group.count += 1
         else:
-            self._groups[key] = _Group(first_ts=ts, last_ts=ts, count=1, raw_index=raw_index)
-            self._order.append(key)
+            self._groups[group_key] = _Group(
+                first_ts=ts,
+                last_ts=ts,
+                count=1,
+                raw_index=raw_index,
+            )
+            self._order.append(group_key)
 
     def _flush_expired(self, current_ts: datetime) -> Generator[str, None, None]:
+        """Emit and remove all groups whose window has elapsed before *current_ts*."""
         expired = [
-            k for k, g in self._groups.items()
-            if (current_ts - g.first_ts).total_seconds() > self._window
+            group_key
+            for group_key, group in self._groups.items()
+            if (current_ts - group.first_ts).total_seconds() > self._window
         ]
         if not expired:
             return
         yield from self._emit_sorted(expired)
         expired_set = set(expired)
-        for k in expired:
-            del self._groups[k]
-        self._order[:] = [k for k in self._order if k not in expired_set]
+        for group_key in expired:
+            del self._groups[group_key]
+        self._order[:] = [
+            group_key for group_key in self._order if group_key not in expired_set
+        ]
 
     def _flush_all(self) -> Generator[str, None, None]:
+        """Emit every remaining group and reset state."""
         if self._groups:
             yield from self._emit_sorted(self._order)
             self._groups.clear()
             self._order.clear()
 
     def _emit_sorted(self, keys: list[_GroupKey]) -> Generator[str, None, None]:
-        for key in sorted(keys, key=lambda k: (self._groups[k].first_ts, self._groups[k].raw_index)):
-            g = self._groups[key]
-            level, fields = key
-            if level == Level.ERROR and g.count >= self._threshold:
+        """Yield formatted strings for *keys* sorted by (first_ts, raw_index)."""
+        sorted_keys = sorted(
+            keys,
+            key=lambda candidate: (
+                self._groups[candidate].first_ts,
+                self._groups[candidate].raw_index,
+            ),
+        )
+        for group_key in sorted_keys:
+            group = self._groups[group_key]
+            level, fields = group_key
+            if level == Level.ERROR and group.count >= self._threshold:
                 level = Level.CRITICAL
-            yield self._render(g.first_ts, g.last_ts, level, fields, g.count)
+            yield self._render(group.first_ts, group.last_ts, level, fields, group.count)
 
     # ── Pure static helpers ──────────────────────────────────────────────
 
     @staticmethod
-    def _parse_line(line: str, index: int) -> tuple[datetime, str, _Fields] | None:
+    def _parse_line(
+        line: str,
+        index: int,
+    ) -> tuple[datetime, str, _Fields] | None:
+        """Parse one log line; return (timestamp, level, fields) or None if malformed."""
         tokens = line.split()
         if len(tokens) < 2:
             return None
@@ -124,10 +168,10 @@ class _LogCompactor:
         for token in tokens[2:]:
             if "=" not in token:
                 return None
-            key, _, value = token.partition("=")
-            if not key:
+            field_name, _, field_value = token.partition("=")
+            if not field_name:
                 return None
-            fields[key] = value
+            fields[field_name] = field_value
 
         if "user_id" in fields and "user" in fields:
             if fields["user_id"] != fields["user"]:
@@ -147,7 +191,14 @@ class _LogCompactor:
         return ts, level, tuple(sorted(fields.items()))
 
     @staticmethod
-    def _render(start: datetime, end: datetime, level: str, fields: _Fields, count: int) -> str:
+    def _render(
+        start: datetime,
+        end: datetime,
+        level: str,
+        fields: _Fields,
+        count: int,
+    ) -> str:
+        """Format a compacted group as a single output string."""
         if start == end:
             ts_range = start.isoformat()
         elif start.date() == end.date():
@@ -155,7 +206,7 @@ class _LogCompactor:
         else:
             ts_range = f"{start.isoformat()}~{end.isoformat()}"
 
-        parts = [ts_range, level, *(f"{k}={v}" for k, v in fields)]
+        parts = [ts_range, level, *(f"{name}={value}" for name, value in fields)]
         if count > 1:
             parts.append(f"(x{count})")
         return " ".join(parts)
@@ -166,19 +217,32 @@ def compact_logs(
     dedup_window_seconds: int,
     error_threshold: int,
 ) -> Generator[str, None, None]:
-    """Read logs from *file_path* and yield compacted log strings."""
+    """Read logs from *file_path* and return a generator of compacted log strings."""
     return _LogCompactor.process_file(file_path, dedup_window_seconds, error_threshold)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Compact a structured log file by deduplicating and escalating entries."
+        description="Compact a structured log file by deduplicating and escalating entries.",
     )
-    parser.add_argument("file_path", help="Path to the log file")
-    parser.add_argument("--window", type=int, default=60, metavar="SECONDS",
-                        help="Deduplication window in seconds (default: 60)")
-    parser.add_argument("--threshold", type=int, default=3, metavar="N",
-                        help="Error count threshold for CRITICAL escalation (default: 3)")
+    parser.add_argument(
+        "file_path",
+        help="Path to the log file",
+    )
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=60,
+        metavar="SECONDS",
+        help="Deduplication window in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Error count threshold for CRITICAL escalation (default: 3)",
+    )
     args = parser.parse_args()
 
     try:
