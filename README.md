@@ -1,0 +1,1 @@
+# LightWork AI Python Assessment
