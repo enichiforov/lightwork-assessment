@@ -1,18 +1,17 @@
-"""Log compactor: deduplicates, escalates, enriches and normalises log entries."""
+"""
+Log compactor: deduplicates, escalates, enriches and normalises log entries.
 
-from __future__ import annotations
+Assumptions:
+- A "level" token is any non-empty all-uppercase ASCII letter sequence.
+  The spec says "includes but is not limited to DEBUG, INFO, WARNING, ERROR".
+- Dedup window boundary is inclusive: diff <= dedup_window_seconds groups entries.
+- Separator between output tokens is a single space.
+"""
 
 import re
 from collections.abc import Generator
 from datetime import datetime
 from typing import NamedTuple
-
-_TS_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
-    r"(?:\.\d+)?"
-    r"$"
-)
-_VALID_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
 class _LogEntry(NamedTuple):
@@ -41,7 +40,7 @@ def _parse_line(line: str, index: int) -> _LogEntry | None:
         return None
 
     level = tokens[1]
-    if level not in _VALID_LEVELS:
+    if not re.fullmatch(r"[A-Z]+", level):
         return None
 
     fields: dict[str, str] = {}
@@ -65,14 +64,12 @@ def _parse_line(line: str, index: int) -> _LogEntry | None:
     code_val = fields.get("code")
     if code_val is not None:
         try:
-            code_int = int(code_val)
-            if 500 <= code_int <= 599:
+            if 500 <= int(code_val) <= 599:
                 level = "ERROR"
         except ValueError:
             pass
 
-    sorted_fields = tuple(sorted(fields.items()))
-    return _LogEntry(ts, level, sorted_fields, index)
+    return _LogEntry(ts, level, tuple(sorted(fields.items())), index)
 
 
 def _format_ts_range(start: datetime, end: datetime) -> str:
@@ -91,11 +88,10 @@ def _format_entry(
     count: int,
 ) -> str:
     parts = [_format_ts_range(start, end), level]
-    for key, value in fields:
-        parts.append(f"{key}={value}")
+    parts.extend(f"{k}={v}" for k, v in fields)
     if count > 1:
-        parts.append(f"(x {count})")
-    return "   ".join(parts)
+        parts.append(f"(x{count})")
+    return " ".join(parts)
 
 
 def compact_logs(
@@ -108,56 +104,55 @@ def compact_logs(
     # Active groups keyed by (level, fields).
     # Value: [first_ts, last_ts, count, raw_index]
     groups: dict[tuple[str, tuple[tuple[str, str], ...]], list] = {}
-    # Maintain insertion order so we can emit in stable order.
+    # Insertion order for stable chronological output.
     order: list[tuple[str, tuple[tuple[str, str], ...]]] = []
 
+    def _emit(
+        first_ts: datetime,
+        last_ts: datetime,
+        level: str,
+        fields: tuple[tuple[str, str], ...],
+        count: int,
+    ) -> str:
+        if level == "ERROR" and count >= error_threshold:
+            level = "CRITICAL"
+        return _format_entry(first_ts, last_ts, level, fields, count)
+
     def _flush_all() -> Generator[str, None, None]:
-        # Sort by (first_ts, raw_index) for chronological + stable ordering.
         pending = []
         for key in order:
             if key not in groups:
                 continue
             first_ts, last_ts, count, idx = groups[key]
             level, fields = key
-            # Escalation
-            if level == "ERROR" and count >= error_threshold:
-                level = "CRITICAL"
-            pending.append((first_ts, idx, level, fields, last_ts, count))
+            pending.append((first_ts, idx, last_ts, level, fields, count))
         pending.sort(key=lambda x: (x[0], x[1]))
-        for first_ts, _, level, fields, last_ts, count in pending:
-            yield _format_entry(first_ts, last_ts, level, fields, count)
+        for first_ts, _, last_ts, level, fields, count in pending:
+            yield _emit(first_ts, last_ts, level, fields, count)
         groups.clear()
         order.clear()
 
-    def _try_flush_expired(
-        current_ts: datetime,
-    ) -> Generator[str, None, None]:
-        """Flush groups whose window has expired relative to *current_ts*."""
-        expired_keys: list[tuple[str, tuple[tuple[str, str], ...]]] = []
-        for key, (first_ts, last_ts, count, idx) in groups.items():
-            diff = (current_ts - first_ts).total_seconds()
-            if diff > dedup_window_seconds:
-                expired_keys.append(key)
-
+    def _flush_expired(current_ts: datetime) -> Generator[str, None, None]:
+        expired_keys = [
+            key
+            for key, (first_ts, *_) in groups.items()
+            if (current_ts - first_ts).total_seconds() > dedup_window_seconds
+        ]
         if not expired_keys:
             return
 
-        # Collect and sort expired entries.
         pending = []
         for key in expired_keys:
             first_ts, last_ts, count, idx = groups.pop(key)
             level, fields = key
-            if level == "ERROR" and count >= error_threshold:
-                level = "CRITICAL"
-            pending.append((first_ts, idx, level, fields, last_ts, count))
+            pending.append((first_ts, idx, last_ts, level, fields, count))
         pending.sort(key=lambda x: (x[0], x[1]))
 
-        # Rebuild order list without expired keys.
         expired_set = set(expired_keys)
         order[:] = [k for k in order if k not in expired_set]
 
-        for first_ts, _, level, fields, last_ts, count in pending:
-            yield _format_entry(first_ts, last_ts, level, fields, count)
+        for first_ts, _, last_ts, level, fields, count in pending:
+            yield _emit(first_ts, last_ts, level, fields, count)
 
     with open(file_path, encoding="utf-8") as fh:
         for raw_index, raw_line in enumerate(fh):
@@ -169,8 +164,7 @@ def compact_logs(
             if entry is None:
                 continue
 
-            # Flush any groups that can no longer accept this entry.
-            yield from _try_flush_expired(entry.timestamp)
+            yield from _flush_expired(entry.timestamp)
 
             key = (entry.level, entry.fields)
             if key in groups:
@@ -179,25 +173,11 @@ def compact_logs(
                 if diff <= dedup_window_seconds:
                     groups[key] = [first_ts, entry.timestamp, count + 1, idx]
                 else:
-                    # Window exceeded — flush old group, start new.
-                    level, fields = key
-                    if level == "ERROR" and count >= error_threshold:
-                        level = "CRITICAL"
-                    yield _format_entry(first_ts, last_ts, level, fields, count)
-                    groups[key] = [
-                        entry.timestamp,
-                        entry.timestamp,
-                        1,
-                        entry.raw_index,
-                    ]
+                    # Window exceeded — flush old group, start fresh.
+                    yield _emit(first_ts, last_ts, entry.level, entry.fields, count)
+                    groups[key] = [entry.timestamp, entry.timestamp, 1, entry.raw_index]
             else:
-                groups[key] = [
-                    entry.timestamp,
-                    entry.timestamp,
-                    1,
-                    entry.raw_index,
-                ]
+                groups[key] = [entry.timestamp, entry.timestamp, 1, entry.raw_index]
                 order.append(key)
 
-    # Flush remaining groups.
     yield from _flush_all()
