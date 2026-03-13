@@ -2,22 +2,37 @@
 Log compactor: deduplicates, escalates, enriches and normalises log entries.
 
 Assumptions:
-- A "level" token is any non-empty all-uppercase ASCII letter sequence.
-  The spec says "includes but is not limited to DEBUG, INFO, WARNING, ERROR".
-- Dedup window boundary is inclusive: diff <= dedup_window_seconds groups entries.
-- Separator between output tokens is a single space.
+- Level is any non-empty sequence of uppercase ASCII letters. The spec states
+  "includes but is not limited to DEBUG, INFO, WARNING, ERROR".
+- Dedup window is inclusive: (last_ts - first_ts).total_seconds() <= window.
 """
 
+import argparse
+import dataclasses
 import re
+import sys
 from collections.abc import Generator
 from datetime import datetime
-from typing import NamedTuple
+from enum import StrEnum
 
 
-class _LogEntry(NamedTuple):
-    timestamp: datetime
-    level: str
-    fields: tuple[tuple[str, str], ...]
+class Level(StrEnum):
+    DEBUG = "DEBUG"
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+    CRITICAL = "CRITICAL"
+
+
+_Fields = tuple[tuple[str, str], ...]
+_GroupKey = tuple[str, _Fields]
+
+
+@dataclasses.dataclass(slots=True)
+class _Group:
+    first_ts: datetime
+    last_ts: datetime
+    count: int
     raw_index: int
 
 
@@ -30,7 +45,7 @@ def _parse_timestamp(raw: str) -> datetime | None:
     return None
 
 
-def _parse_line(line: str, index: int) -> _LogEntry | None:
+def _parse_line(line: str, index: int) -> tuple[datetime, str, _Fields] | None:
     tokens = line.split()
     if len(tokens) < 2:
         return None
@@ -65,11 +80,11 @@ def _parse_line(line: str, index: int) -> _LogEntry | None:
     if code_val is not None:
         try:
             if 500 <= int(code_val) <= 599:
-                level = "ERROR"
+                level = Level.ERROR
         except ValueError:
             pass
 
-    return _LogEntry(ts, level, tuple(sorted(fields.items())), index)
+    return ts, level, tuple(sorted(fields.items()))
 
 
 def _format_ts_range(start: datetime, end: datetime) -> str:
@@ -80,15 +95,8 @@ def _format_ts_range(start: datetime, end: datetime) -> str:
     return f"{start.isoformat()}~{end.isoformat()}"
 
 
-def _format_entry(
-    start: datetime,
-    end: datetime,
-    level: str,
-    fields: tuple[tuple[str, str], ...],
-    count: int,
-) -> str:
-    parts = [_format_ts_range(start, end), level]
-    parts.extend(f"{k}={v}" for k, v in fields)
+def _format_entry(start: datetime, end: datetime, level: str, fields: _Fields, count: int) -> str:
+    parts = [_format_ts_range(start, end), level, *(f"{k}={v}" for k, v in fields)]
     if count > 1:
         parts.append(f"(x{count})")
     return " ".join(parts)
@@ -101,58 +109,38 @@ def compact_logs(
 ) -> Generator[str, None, None]:
     """Read logs from *file_path* and yield compacted log strings."""
 
-    # Active groups keyed by (level, fields).
-    # Value: [first_ts, last_ts, count, raw_index]
-    groups: dict[tuple[str, tuple[tuple[str, str], ...]], list] = {}
-    # Insertion order for stable chronological output.
-    order: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+    groups: dict[_GroupKey, _Group] = {}
+    order: list[_GroupKey] = []
 
-    def _emit(
-        first_ts: datetime,
-        last_ts: datetime,
-        level: str,
-        fields: tuple[tuple[str, str], ...],
-        count: int,
-    ) -> str:
-        if level == "ERROR" and count >= error_threshold:
-            level = "CRITICAL"
-        return _format_entry(first_ts, last_ts, level, fields, count)
+    def _emit(key: _GroupKey, g: _Group) -> str:
+        level, fields = key
+        if level == Level.ERROR and g.count >= error_threshold:
+            level = Level.CRITICAL
+        return _format_entry(g.first_ts, g.last_ts, level, fields, g.count)
 
-    def _flush_all() -> Generator[str, None, None]:
-        pending = []
-        for key in order:
-            if key not in groups:
-                continue
-            first_ts, last_ts, count, idx = groups[key]
-            level, fields = key
-            pending.append((first_ts, idx, last_ts, level, fields, count))
-        pending.sort(key=lambda x: (x[0], x[1]))
-        for first_ts, _, last_ts, level, fields, count in pending:
-            yield _emit(first_ts, last_ts, level, fields, count)
-        groups.clear()
-        order.clear()
+    def _emit_sorted(keys: list[_GroupKey]) -> Generator[str, None, None]:
+        pending = sorted(keys, key=lambda k: (groups[k].first_ts, groups[k].raw_index))
+        for key in pending:
+            yield _emit(key, groups[key])
 
     def _flush_expired(current_ts: datetime) -> Generator[str, None, None]:
-        expired_keys = [
-            key
-            for key, (first_ts, *_) in groups.items()
-            if (current_ts - first_ts).total_seconds() > dedup_window_seconds
+        expired = [
+            k for k, g in groups.items()
+            if (current_ts - g.first_ts).total_seconds() > dedup_window_seconds
         ]
-        if not expired_keys:
+        if not expired:
             return
-
-        pending = []
-        for key in expired_keys:
-            first_ts, last_ts, count, idx = groups.pop(key)
-            level, fields = key
-            pending.append((first_ts, idx, last_ts, level, fields, count))
-        pending.sort(key=lambda x: (x[0], x[1]))
-
-        expired_set = set(expired_keys)
+        yield from _emit_sorted(expired)
+        expired_set = set(expired)
+        for k in expired:
+            del groups[k]
         order[:] = [k for k in order if k not in expired_set]
 
-        for first_ts, _, last_ts, level, fields, count in pending:
-            yield _emit(first_ts, last_ts, level, fields, count)
+    def _flush_all() -> Generator[str, None, None]:
+        if groups:
+            yield from _emit_sorted(order)
+            groups.clear()
+            order.clear()
 
     with open(file_path, encoding="utf-8") as fh:
         for raw_index, raw_line in enumerate(fh):
@@ -160,24 +148,49 @@ def compact_logs(
             if not line:
                 continue
 
-            entry = _parse_line(line, raw_index)
-            if entry is None:
+            parsed = _parse_line(line, raw_index)
+            if parsed is None:
                 continue
 
-            yield from _flush_expired(entry.timestamp)
+            ts, level, fields = parsed
+            yield from _flush_expired(ts)
 
-            key = (entry.level, entry.fields)
+            key: _GroupKey = (level, fields)
             if key in groups:
-                first_ts, last_ts, count, idx = groups[key]
-                diff = (entry.timestamp - first_ts).total_seconds()
-                if diff <= dedup_window_seconds:
-                    groups[key] = [first_ts, entry.timestamp, count + 1, idx]
-                else:
-                    # Window exceeded — flush old group, start fresh.
-                    yield _emit(first_ts, last_ts, entry.level, entry.fields, count)
-                    groups[key] = [entry.timestamp, entry.timestamp, 1, entry.raw_index]
+                g = groups[key]
+                g.last_ts = ts
+                g.count += 1
             else:
-                groups[key] = [entry.timestamp, entry.timestamp, 1, entry.raw_index]
+                groups[key] = _Group(first_ts=ts, last_ts=ts, count=1, raw_index=raw_index)
                 order.append(key)
 
     yield from _flush_all()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Compact a structured log file by deduplicating and escalating entries."
+    )
+    parser.add_argument("file_path", help="Path to the log file")
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=60,
+        metavar="SECONDS",
+        help="Deduplication window in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Error count threshold for CRITICAL escalation (default: 3)",
+    )
+    args = parser.parse_args()
+
+    try:
+        for entry in compact_logs(args.file_path, args.window, args.threshold):
+            print(entry)
+    except FileNotFoundError:
+        print(f"error: file not found: {args.file_path}", file=sys.stderr)
+        sys.exit(1)
