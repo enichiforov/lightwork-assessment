@@ -67,7 +67,6 @@ def _parse_line(line: str, index: int) -> tuple[datetime, str, _Fields] | None:
             return None
         fields[key] = value
 
-    # Normalise user_id -> user
     if "user_id" in fields and "user" in fields:
         if fields["user_id"] != fields["user"]:
             return None  # conflict → malformed
@@ -75,7 +74,6 @@ def _parse_line(line: str, index: int) -> tuple[datetime, str, _Fields] | None:
     elif "user_id" in fields:
         fields["user"] = fields.pop("user_id")
 
-    # Enrichment: code 500-599 → ERROR
     code_val = fields.get("code")
     if code_val is not None:
         try:
@@ -102,69 +100,72 @@ def _format_entry(start: datetime, end: datetime, level: str, fields: _Fields, c
     return " ".join(parts)
 
 
+class _LogCompactor:
+    def __init__(self, dedup_window_seconds: int, error_threshold: int) -> None:
+        self._window = dedup_window_seconds
+        self._threshold = error_threshold
+        self._groups: dict[_GroupKey, _Group] = {}
+        self._order: list[_GroupKey] = []
+
+    def feed(self, ts: datetime, level: str, fields: _Fields, raw_index: int) -> Generator[str, None, None]:
+        yield from self._flush_expired(ts)
+        key: _GroupKey = (level, fields)
+        if key in self._groups:
+            g = self._groups[key]
+            g.last_ts = ts
+            g.count += 1
+        else:
+            self._groups[key] = _Group(first_ts=ts, last_ts=ts, count=1, raw_index=raw_index)
+            self._order.append(key)
+
+    def flush(self) -> Generator[str, None, None]:
+        if self._groups:
+            yield from self._emit_sorted(self._order)
+            self._groups.clear()
+            self._order.clear()
+
+    def _flush_expired(self, current_ts: datetime) -> Generator[str, None, None]:
+        expired = [
+            k for k, g in self._groups.items()
+            if (current_ts - g.first_ts).total_seconds() > self._window
+        ]
+        if not expired:
+            return
+        yield from self._emit_sorted(expired)
+        expired_set = set(expired)
+        for k in expired:
+            del self._groups[k]
+        self._order[:] = [k for k in self._order if k not in expired_set]
+
+    def _emit_sorted(self, keys: list[_GroupKey]) -> Generator[str, None, None]:
+        for key in sorted(keys, key=lambda k: (self._groups[k].first_ts, self._groups[k].raw_index)):
+            yield self._format_group(key, self._groups[key])
+
+    def _format_group(self, key: _GroupKey, g: _Group) -> str:
+        level, fields = key
+        if level == Level.ERROR and g.count >= self._threshold:
+            level = Level.CRITICAL
+        return _format_entry(g.first_ts, g.last_ts, level, fields, g.count)
+
+
 def compact_logs(
     file_path: str,
     dedup_window_seconds: int,
     error_threshold: int,
 ) -> Generator[str, None, None]:
     """Read logs from *file_path* and yield compacted log strings."""
-
-    groups: dict[_GroupKey, _Group] = {}
-    order: list[_GroupKey] = []
-
-    def _emit(key: _GroupKey, g: _Group) -> str:
-        level, fields = key
-        if level == Level.ERROR and g.count >= error_threshold:
-            level = Level.CRITICAL
-        return _format_entry(g.first_ts, g.last_ts, level, fields, g.count)
-
-    def _emit_sorted(keys: list[_GroupKey]) -> Generator[str, None, None]:
-        pending = sorted(keys, key=lambda k: (groups[k].first_ts, groups[k].raw_index))
-        for key in pending:
-            yield _emit(key, groups[key])
-
-    def _flush_expired(current_ts: datetime) -> Generator[str, None, None]:
-        expired = [
-            k for k, g in groups.items()
-            if (current_ts - g.first_ts).total_seconds() > dedup_window_seconds
-        ]
-        if not expired:
-            return
-        yield from _emit_sorted(expired)
-        expired_set = set(expired)
-        for k in expired:
-            del groups[k]
-        order[:] = [k for k in order if k not in expired_set]
-
-    def _flush_all() -> Generator[str, None, None]:
-        if groups:
-            yield from _emit_sorted(order)
-            groups.clear()
-            order.clear()
-
+    compactor = _LogCompactor(dedup_window_seconds, error_threshold)
     with open(file_path, encoding="utf-8") as fh:
         for raw_index, raw_line in enumerate(fh):
             line = raw_line.rstrip("\n\r")
             if not line:
                 continue
-
             parsed = _parse_line(line, raw_index)
             if parsed is None:
                 continue
-
             ts, level, fields = parsed
-            yield from _flush_expired(ts)
-
-            key: _GroupKey = (level, fields)
-            if key in groups:
-                g = groups[key]
-                g.last_ts = ts
-                g.count += 1
-            else:
-                groups[key] = _Group(first_ts=ts, last_ts=ts, count=1, raw_index=raw_index)
-                order.append(key)
-
-    yield from _flush_all()
+            yield from compactor.feed(ts, level, fields, raw_index)
+    yield from compactor.flush()
 
 
 if __name__ == "__main__":
